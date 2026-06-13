@@ -13,6 +13,7 @@ Tools:
 """
 
 import os
+import re
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -32,6 +33,90 @@ def _get_groq_client():
             "GROQ_API_KEY not set. Add it to a .env file in the project root."
         )
     return Groq(api_key=api_key)
+
+
+# ── search_listings helpers ───────────────────────────────────────────────────
+
+_SIZE_ORDER = ["xxs", "xs", "s", "m", "l", "xl", "xxl", "xxxl"]
+
+_STOPWORDS = {
+    "a", "an", "the", "is", "in", "at", "of", "for", "and", "or",
+    "but", "with", "from", "on", "to", "by", "it", "be", "as", "up",
+    "no", "so", "do", "if", "its", "just", "not", "this", "that",
+}
+
+
+def _tokenize(text: str) -> set[str]:
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
+    return {t for t in tokens if t not in _STOPWORDS and len(t) > 1}
+
+
+def _expand_named_sizes(sz: str) -> set[str]:
+    """Pull standard size labels (s/m/l/xl…) out of a composite size string."""
+    return {p for p in re.split(r"[\s/()\-]+", sz.lower()) if p in _SIZE_ORDER}
+
+
+def _size_matches(query: str, listing_size: str, flex: int = 1) -> bool:
+    ql = query.lower().strip()
+    ll = listing_size.lower().strip()
+
+    if "one size" in ll:
+        return True
+    if ql == ll:
+        return True
+
+    # US shoe sizes — allow ±0.5
+    us_q = re.match(r"us\s*(\d+\.?\d*)", ql)
+    us_l = re.match(r"us\s*(\d+\.?\d*)", ll)
+    if us_q and us_l:
+        return abs(float(us_q.group(1)) - float(us_l.group(1))) <= 0.5
+
+    # Waist sizes — allow ±1 inch
+    w_q = re.match(r"w(\d+)", ql)
+    w_l = re.match(r"w(\d+)", ll)
+    if w_q and w_l:
+        return abs(int(w_q.group(1)) - int(w_l.group(1))) <= 1
+
+    # Named sizes with ±flex steps
+    q_sizes = _expand_named_sizes(ql) or {ql}
+    l_sizes = _expand_named_sizes(ll) or {ll}
+
+    if q_sizes & l_sizes:
+        return True
+
+    for qs in q_sizes:
+        if qs not in _SIZE_ORDER:
+            continue
+        qi = _SIZE_ORDER.index(qs)
+        for ls in l_sizes:
+            if ls in _SIZE_ORDER and abs(qi - _SIZE_ORDER.index(ls)) <= flex:
+                return True
+
+    return False
+
+
+def _score_listing(tokens: set[str], listing: dict) -> int:
+    """Keyword overlap score. Higher field weights for more specific matches."""
+    score = 0
+    score += 3 * len(tokens & _tokenize(listing["title"]))
+
+    tag_tokens: set[str] = set()
+    for tag in listing.get("style_tags", []):
+        tag_tokens |= _tokenize(tag)
+    score += 2 * len(tokens & tag_tokens)
+
+    color_tokens: set[str] = set()
+    for color in listing.get("colors", []):
+        color_tokens |= _tokenize(color)
+    score += 2 * len(tokens & color_tokens)
+
+    score += 2 * len(tokens & _tokenize(listing.get("category", "")))
+
+    if listing.get("brand"):
+        score += 2 * len(tokens & _tokenize(listing["brand"]))
+
+    score += len(tokens & _tokenize(listing["description"]))
+    return score
 
 
 # ── Tool 1: search_listings ───────────────────────────────────────────────────
@@ -69,8 +154,80 @@ def search_listings(
 
     Before writing code, fill in the Tool 1 section of planning.md.
     """
-    # Replace this with your implementation
-    return []
+    listings = load_listings()
+    tokens = _tokenize(description)
+
+    # 1. Hard price filter
+    if max_price is not None:
+        price_ok = [l for l in listings if l["price"] <= max_price]
+        if not price_ok:
+            # Find the lowest price among description-relevant items (ignoring price)
+            scored_all = [(l, _score_listing(tokens, l)) for l in listings]
+            relevant = [l for l, s in scored_all if s > 0] or listings
+            return {
+                "status": "price_too_low",
+                "lowest_matching_price": min(l["price"] for l in relevant),
+            }
+    else:
+        price_ok = listings
+
+    # 2. Score by description
+    scored = [(l, _score_listing(tokens, l)) for l in price_ok]
+    desc_matched = [(l, s) for l, s in scored if s > 0]
+
+    if not desc_matched:
+        return {"status": "no_results", "message": "No items match that description."}
+
+    # 3. Soft size filter
+    if size is not None:
+        size_matched = [(l, s) for l, s in desc_matched if _size_matches(size, l["size"])]
+        if not size_matched:
+            items = [l for l, _ in sorted(desc_matched, key=lambda x: x[1], reverse=True)]
+            return {"status": "size_relaxed", "items": items}
+        result_pairs = size_matched
+    else:
+        result_pairs = desc_matched
+
+    result_pairs.sort(key=lambda x: x[1], reverse=True)
+    return [l for l, _ in result_pairs]
+
+
+# ── suggest_outfit helpers ────────────────────────────────────────────────────
+
+_REQUIRED_CATEGORIES = {
+    "tops":        ["bottoms", "shoes"],
+    "bottoms":     ["tops", "shoes"],
+    "shoes":       ["tops", "bottoms"],
+    "outerwear":   ["tops", "bottoms", "shoes"],
+    "accessories": ["tops", "bottoms", "shoes"],
+}
+_ALWAYS_OPTIONAL = {"outerwear", "accessories"}
+_NEUTRAL_COLORS = {
+    "black", "white", "grey", "gray", "cream", "tan", "beige",
+    "navy", "ecru", "off-white", "natural", "ivory",
+}
+
+
+def _item_name(item: dict) -> str:
+    """Wardrobe items use 'name'; listings use 'title'."""
+    return item.get("name") or item.get("title", "Unknown item")
+
+
+def _compat_score(new_item: dict, candidate: dict) -> int:
+    """Score how well a wardrobe item pairs with the new item."""
+    score = 0
+    new_tags = set(new_item.get("style_tags", []))
+    cand_tags = set(candidate.get("style_tags", []))
+    score += 2 * len(new_tags & cand_tags)
+
+    new_colors = {c.lower() for c in new_item.get("colors", [])}
+    cand_colors = {c.lower() for c in candidate.get("colors", [])}
+    if new_colors & cand_colors:
+        score += 1
+    if cand_colors & _NEUTRAL_COLORS or new_colors & _NEUTRAL_COLORS:
+        score += 1
+
+    return score
 
 
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
@@ -100,8 +257,102 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
 
     Before writing code, fill in the Tool 2 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    items = wardrobe.get("items", [])
+    if not items:
+        return {"status": "empty_wardrobe"}
+
+    new_cat = new_item.get("category", "")
+    required_from_wardrobe = _REQUIRED_CATEGORIES.get(new_cat, [])
+
+    # Group wardrobe items by category
+    by_cat: dict[str, list] = {}
+    for item in items:
+        by_cat.setdefault(item.get("category", ""), []).append(item)
+
+    # Hard check: required categories must exist in wardrobe
+    missing_required = [c for c in required_from_wardrobe if not by_cat.get(c)]
+    if missing_required:
+        return {"status": "missing_required_category", "missing": missing_required}
+
+    # Score every wardrobe item against the new item
+    scored_by_cat = {
+        cat: sorted(cat_items, key=lambda i: _compat_score(new_item, i), reverse=True)
+        for cat, cat_items in by_cat.items()
+    }
+    # Required pools: top 2 per required category → vary outfits across these
+    req_pools = [scored_by_cat[cat][:2] for cat in required_from_wardrobe]
+
+    print("\n── req_pools ──")
+    for cat, pool in zip(required_from_wardrobe, req_pools):
+        print(f"  [{cat}]")
+        for item in pool:
+            print(f"    score={_compat_score(new_item, item)}  {_item_name(item)}")
+
+    # Optional items: best 1 per available optional category (excluding new_item's own cat)
+    opt_items = [
+        scored_by_cat[cat][0]
+        for cat in _ALWAYS_OPTIONAL
+        if cat != new_cat and scored_by_cat.get(cat)
+    ]
+
+    print("\n── opt_items ──")
+    for item in opt_items:
+        print(f"  [{item.get('category')}] score={_compat_score(new_item, item)}  {_item_name(item)}")
+
+    # Build prompt: LLM selects best 2 outfits and writes descriptions
+    new_name = _item_name(new_item)
+
+    req_section = "\n".join(
+        f"  {cat.capitalize()}: "
+        + ", ".join(f'"{_item_name(i)}"' for i in pool)
+        for cat, pool in zip(required_from_wardrobe, req_pools)
+    )
+    opt_section = "\n".join(
+        f"  {item.get('category', '').capitalize()}: \"{_item_name(item)}\""
+        for item in opt_items
+    ) or "  (none available)"
+
+    print("\n── prompt candidates ──")
+    print(f"  new item : {new_name}")
+    print(f"  required :\n{req_section}")
+    print(f"  optional :\n{opt_section}")
+
+    client = _get_groq_client()
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{
+            "role": "user",
+            "content": (
+                "You are an enthusiastic thrift fashion stylist.\n\n"
+                f'The user is considering: "{new_name}" '
+                f"(style: {', '.join(new_item.get('style_tags', []))})\n\n"
+                "Pick the best 2 outfits from these wardrobe candidates.\n"
+                "Each outfit MUST include the new item + one pick from each required group.\n"
+                "Add optional items only if they genuinely elevate the look.\n\n"
+                f"Required (pick ONE per group):\n{req_section}\n\n"
+                f"Optional (include only if it works):\n{opt_section}\n\n"
+                "Write 2 outfit descriptions (2–3 sentences each, numbered, "
+                "name the specific pieces, keep it casual and stylish)."
+            ),
+        }],
+        temperature=0.7,
+    )
+    outfit_string = response.choices[0].message.content.strip()
+
+    # Determine which optional categories are absent from the wardrobe entirely
+    missing_optional = [
+        cat for cat in _ALWAYS_OPTIONAL
+        if cat != new_cat and not scored_by_cat.get(cat)
+    ]
+
+    if missing_optional:
+        return {
+            "status": "partial_outfit",
+            "missing_optional": missing_optional,
+            "outfits": outfit_string,
+        }
+
+    return outfit_string
 
 
 # ── Tool 3: create_fit_card ───────────────────────────────────────────────────
@@ -133,5 +384,40 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
 
     Before writing code, fill in the Tool 3 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    if not outfit or not outfit.strip():
+        # Can't detect which categories are missing from a free-text string,
+        # so missing is left empty — the agent should avoid calling this tool
+        # if suggest_outfit returned a non-string status.
+        return {"status": "incomplete_outfit", "missing": []}
+
+    item_name = _item_name(new_item)
+    price = new_item.get("price")
+    platform = new_item.get("platform")
+    style_tags = new_item.get("style_tags", [])
+
+    item_line = item_name
+    if price:
+        item_line += f" (${price:.2f}"
+        item_line += f" on {platform})" if platform else ")"
+
+    client = _get_groq_client()
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{
+            "role": "user",
+            "content": (
+                "Write a 1–3 sentence Instagram caption for this thrift outfit.\n\n"
+                f"Key thrifted piece: {item_line}"
+                + (f"\nStyle: {', '.join(style_tags)}" if style_tags else "")
+                + f"\n\nOutfit:\n{outfit}\n\n"
+                "Rules:\n"
+                "- Sound like a real OOTD post, not a product description\n"
+                "- Mention the item name, price, and platform once each, naturally\n"
+                "- Capture the specific vibe — be concrete, not generic\n"
+                "- No filler phrases like 'slaying', 'serving looks', 'super cute'\n"
+                "- Max 3 sentences"
+            ),
+        }],
+        temperature=0.9,
+    )
+    return response.choices[0].message.content.strip()
