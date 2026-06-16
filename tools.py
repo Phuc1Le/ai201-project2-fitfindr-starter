@@ -20,7 +20,7 @@ from groq import Groq
 
 from utils.data_loader import load_listings
 
-load_dotenv()
+load_dotenv(override=True)
 
 
 # ── Groq client ───────────────────────────────────────────────────────────────
@@ -56,7 +56,7 @@ def _expand_named_sizes(sz: str) -> set[str]:
     return {p for p in re.split(r"[\s/()\-]+", sz.lower()) if p in _SIZE_ORDER}
 
 
-def _size_matches(query: str, listing_size: str, flex: int = 1) -> bool:
+def _size_matches(query: str, listing_size: str, flex: int = 1, shoe_flex: float = 0.5) -> bool:
     ql = query.lower().strip()
     ll = listing_size.lower().strip()
 
@@ -65,16 +65,16 @@ def _size_matches(query: str, listing_size: str, flex: int = 1) -> bool:
     if ql == ll:
         return True
 
-    # US shoe sizes — allow ±0.5
+    # US shoe sizes
     us_q = re.match(r"us\s*(\d+\.?\d*)", ql)
     us_l = re.match(r"us\s*(\d+\.?\d*)", ll)
     if us_q and us_l:
-        return abs(float(us_q.group(1)) - float(us_l.group(1))) <= 0.5
+        return abs(float(us_q.group(1)) - float(us_l.group(1))) <= shoe_flex
 
-    # Bare number (e.g. "8") against a US-formatted listing (e.g. "US 8") — same ±0.5 flex
+    # Bare number (e.g. "8") against a US-formatted listing (e.g. "US 8")
     num_q = re.match(r"^(\d+\.?\d*)$", ql)
     if num_q and us_l:
-        return abs(float(num_q.group(1)) - float(us_l.group(1))) <= 0.5
+        return abs(float(num_q.group(1)) - float(us_l.group(1))) <= shoe_flex
 
     # Waist sizes — allow ±1 inch
     w_q = re.match(r"w(\d+)", ql)
@@ -187,13 +187,15 @@ def search_listings(
     if not desc_matched:
         return {"status": "no_results", "message": "No items match that description."}
 
-    # 3. Soft size filter
+    # 3. Soft size filter — exact match first, flex match second (triggers size_relaxed)
     if size is not None:
-        size_matched = [(l, s) for l, s in desc_matched if _size_matches(size, l["size"])]
-        if not size_matched:
-            items = [l for l, _ in sorted(desc_matched, key=lambda x: x[1], reverse=True)]
+        size_exact = [(l, s) for l, s in desc_matched if _size_matches(size, l["size"], flex=0, shoe_flex=0.0)]
+        if size_exact:
+            result_pairs = size_exact
+        else:
+            size_flex = [(l, s) for l, s in desc_matched if _size_matches(size, l["size"])]
+            items = [l for l, _ in sorted(size_flex or desc_matched, key=lambda x: x[1], reverse=True)]
             return {"status": "size_relaxed", "items": items}
-        result_pairs = size_matched
     else:
         result_pairs = desc_matched
 

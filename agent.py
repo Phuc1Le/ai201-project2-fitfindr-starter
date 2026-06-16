@@ -27,7 +27,7 @@ from groq import Groq
 
 from tools import search_listings, suggest_outfit, create_fit_card, check_price
 
-load_dotenv()
+load_dotenv(override=True)
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -57,8 +57,9 @@ When check_price returns a verdict, share it with the user naturally:
 - overpriced:     Note it's above the typical range and let them decide.
 - no_comparables: Tell them there aren't enough similar listings to compare.
 
-Once search_listings has returned a result (even size_relaxed), do NOT call search_listings again.
-Proceed to suggest_outfit with whatever was found. The user can refine their search in a new query.
+Once search_listings has returned a result, do NOT call search_listings again — even if the item
+is not a perfect match. If you try to call it again you will get status "already_searched", which
+means you must call suggest_outfit next. The user can refine their search in a new query.
 
 If the user's message is too vague to identify a specific item (e.g., "I want another listing",
 "show me something", "find me stuff"), do NOT guess a description. Instead, ask them what
@@ -184,6 +185,8 @@ def _new_session(query: str, wardrobe: dict) -> dict:
         "outfit_suggestion": None,
         "fit_card":          None,
         "price_verdict":     None,
+        "size_relaxed":      False,
+        "empty_wardrobe":    False,
         "reply":             None,
         "error":             None,
     }
@@ -199,6 +202,11 @@ def _dispatch_tool(name: str, args: dict, session: dict) -> dict | list:
     Returns a JSON-serializable value that becomes the tool message content.
     """
     if name == "search_listings":
+        if session["selected_item"]:
+            return {
+                "status": "already_searched",
+                "message": "A search was already run this session. Call suggest_outfit to continue.",
+            }
         result = search_listings(**args)
         if isinstance(result, list):
             session["search_results"] = result
@@ -232,18 +240,27 @@ def _dispatch_tool(name: str, args: dict, session: dict) -> dict | list:
             elif status == "no_results":
                 session["error"] = result.get("message", "No matching items found.")
             elif status == "size_relaxed":
-                # Soft failure — items still returned, continue without error
                 items = result.get("items", [])
                 session["search_results"] = items
                 session["selected_item"] = items[0] if items else None
+                session["size_relaxed"] = True
                 item = items[0]
-                return {
-                    "status": "size_relaxed",
-                    "top_item": (
-                        f"{item['title']} — ${item['price']:.2f}, "
-                        f"size {item.get('size', 'N/A')}, {item.get('platform', '')}"
-                    ),
-                }
+                verdict_data = check_price(item)
+                session["price_verdict"] = verdict_data
+                verdict_label = {
+                    "great_deal":     "great deal",
+                    "fair":           "fair price",
+                    "overpriced":     "above average price",
+                    "no_comparables": "no comparable listings to assess price",
+                }.get(verdict_data["verdict"], "")
+                summary = (
+                    f"{item['title']} — ${item['price']:.2f}, "
+                    f"size {item.get('size', 'N/A')}, {item.get('platform', '')}. "
+                    f"Price verdict: {verdict_label}"
+                )
+                if verdict_data.get("median_comparable_price"):
+                    summary += f" (median comparable: ${verdict_data['median_comparable_price']:.2f})"
+                return {"status": "size_relaxed", "top_item": summary}
         return result
 
     elif name == "suggest_outfit":
@@ -252,9 +269,11 @@ def _dispatch_tool(name: str, args: dict, session: dict) -> dict | list:
         result = suggest_outfit(session["selected_item"], session["wardrobe"])
         if isinstance(result, str):
             session["outfit_suggestion"] = result
-        elif isinstance(result, dict) and "outfits" in result:
-            # partial_outfit: still usable, extract the outfit string
-            session["outfit_suggestion"] = result["outfits"]
+        elif isinstance(result, dict):
+            if "outfits" in result:
+                session["outfit_suggestion"] = result["outfits"]
+            elif result.get("status") == "empty_wardrobe":
+                session["empty_wardrobe"] = True
         return result
 
     elif name == "create_fit_card":

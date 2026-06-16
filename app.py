@@ -79,6 +79,9 @@ def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
         if item.get("description"):
             lines += ["", item["description"]]
 
+        if session.get("size_relaxed"):
+            lines += ["", f"⚠ No exact size match — showing closest available size ({item.get('size', 'N/A')})"]
+
         verdict_data = session.get("price_verdict")
         if verdict_data:
             v = verdict_data["verdict"]
@@ -97,9 +100,9 @@ def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
         # No item found — LLM probably asked for clarification; show its reply here
         listing_text = session["reply"] or "No item found."
 
-    # Fall back to LLM reply only when no item was found (empty_wardrobe path).
-    # If an item was found but suggest_outfit wasn't called, keep the panel empty.
-    outfit_text = session["outfit_suggestion"] or (session["reply"] if not item else "") or ""
+    # Fall back to LLM reply in the outfit panel only for empty_wardrobe — that's where
+    # the general styling advice lives. All other cases keep the panel empty if no outfit was made.
+    outfit_text = session["outfit_suggestion"] or (session["reply"] if session.get("empty_wardrobe") else "") or ""
     fit_card_text = session["fit_card"] or ""
 
     return listing_text, outfit_text, fit_card_text
