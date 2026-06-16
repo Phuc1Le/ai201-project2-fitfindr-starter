@@ -71,6 +71,11 @@ def _size_matches(query: str, listing_size: str, flex: int = 1) -> bool:
     if us_q and us_l:
         return abs(float(us_q.group(1)) - float(us_l.group(1))) <= 0.5
 
+    # Bare number (e.g. "8") against a US-formatted listing (e.g. "US 8") — same ±0.5 flex
+    num_q = re.match(r"^(\d+\.?\d*)$", ql)
+    if num_q and us_l:
+        return abs(float(num_q.group(1)) - float(us_l.group(1))) <= 0.5
+
     # Waist sizes — allow ±1 inch
     w_q = re.match(r"w(\d+)", ql)
     w_l = re.match(r"w(\d+)", ll)
@@ -154,6 +159,7 @@ def search_listings(
 
     Before writing code, fill in the Tool 1 section of planning.md.
     """
+    print("Tool search_listing used\n")
     listings = load_listings()
     tokens = _tokenize(description)
 
@@ -161,9 +167,12 @@ def search_listings(
     if max_price is not None:
         price_ok = [l for l in listings if l["price"] <= max_price]
         if not price_ok:
-            # Find the lowest price among description-relevant items (ignoring price)
+            # Check if the description matches anything at all (ignoring price).
+            # If not, the problem is the description, not the budget.
             scored_all = [(l, _score_listing(tokens, l)) for l in listings]
-            relevant = [l for l, s in scored_all if s > 0] or listings
+            relevant = [l for l, s in scored_all if s > 0]
+            if not relevant:
+                return {"status": "no_results", "message": "No items match that description."}
             return {
                 "status": "price_too_low",
                 "lowest_matching_price": min(l["price"] for l in relevant),
@@ -190,6 +199,72 @@ def search_listings(
 
     result_pairs.sort(key=lambda x: x[1], reverse=True)
     return [l for l, _ in result_pairs]
+
+
+# ── Tool 4: check_price ──────────────────────────────────────────────────────
+
+def check_price(item: dict) -> dict:
+    """
+    Compare an item's price against similar listings in the dataset.
+
+    Args:
+        item: A listing dict (the item to evaluate).
+
+    Returns:
+        {
+            "verdict":                  "great_deal" | "fair" | "overpriced" | "no_comparables",
+            "item_price":               float,
+            "median_comparable_price":  float   (omitted for no_comparables),
+            "comparable_count":         int,
+            "price_range":              [min, max] (omitted for no_comparables),
+        }
+
+    Comparables are listings with the same category and at least one shared style tag,
+    excluding the item itself. A minimum of 2 comparables is required for a verdict.
+    Thresholds: < 80 % of median → great_deal, ≤ 110 % → fair, > 110 % → overpriced.
+    """
+    print("Tool check_price used\n")
+    listings = load_listings()
+    category  = item.get("category", "")
+    item_tags = set(item.get("style_tags", []))
+    item_price = item.get("price", 0.0)
+    item_id    = item.get("id")
+
+    comparables = [
+        l for l in listings
+        if l.get("category") == category
+        and l.get("id") != item_id
+        and set(l.get("style_tags", [])) & item_tags
+    ]
+
+    if len(comparables) < 2:
+        d = {
+            "verdict": "no_comparables",
+            "item_price": item_price,
+            "comparable_count": len(comparables),
+        }
+        print(d)
+        return d
+
+    prices = sorted(l["price"] for l in comparables)
+    median = prices[len(prices) // 2]
+
+    if item_price < median * 0.8:
+        verdict = "great_deal"
+    elif item_price <= median * 1.1:
+        verdict = "fair"
+    else:
+        verdict = "overpriced"
+
+    d = {
+        "verdict": verdict,
+        "item_price": item_price,
+        "median_comparable_price": median,
+        "comparable_count": len(comparables),
+        "price_range": [prices[0], prices[-1]],
+    }
+    print(d)
+    return d
 
 
 # ── suggest_outfit helpers ────────────────────────────────────────────────────
@@ -257,6 +332,7 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
 
     Before writing code, fill in the Tool 2 section of planning.md.
     """
+    print("Tool suggest_outfit used\n")
     items = wardrobe.get("items", [])
     if not items:
         return {"status": "empty_wardrobe"}
@@ -384,6 +460,7 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
 
     Before writing code, fill in the Tool 3 section of planning.md.
     """
+    print("Tool create_fit_card used\n")
     if not outfit or not outfit.strip():
         # Can't detect which categories are missing from a free-text string,
         # so missing is left empty — the agent should avoid calling this tool

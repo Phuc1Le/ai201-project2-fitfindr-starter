@@ -32,19 +32,77 @@ def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
         A tuple of three strings:
             (listing_text, outfit_suggestion, fit_card)
         Each string maps to one of the three output panels in the UI.
-
-    TODO:
-        1. Guard against an empty query (return early with an error message).
-        2. Select the wardrobe based on wardrobe_choice.
-        3. Call run_agent() with the query and selected wardrobe.
-        4. If session["error"] is set, return the error in the first panel
-           and empty strings for the other two.
-        5. Otherwise, format session["selected_item"] into a readable listing_text
-           string and return it along with session["outfit_suggestion"] and
-           session["fit_card"].
     """
-    # TODO: implement this function
-    return "Agent not yet implemented.", "", ""
+    print(f"[handle_query] query={user_query!r} wardrobe={wardrobe_choice!r}")
+
+    # 1. Guard empty query
+    if not user_query or not user_query.strip():
+        return "Please enter a search query.", "", ""
+
+    # 2. Select wardrobe
+    wardrobe = (
+        get_example_wardrobe()
+        if wardrobe_choice == "Example wardrobe"
+        else get_empty_wardrobe()
+    )
+
+    # 3. Run agent — catch unexpected crashes so Gradio always gets a string back
+    try:
+        session = run_agent(user_query.strip(), wardrobe)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return f"Unexpected error: {e}", "", ""
+
+    # 4. Error case — use LLM's friendly reply if available, fall back to internal msg
+    if session["error"]:
+        return session["reply"] or session["error"], "", ""
+
+    # 5. Format the top listing into a readable card
+    item = session["selected_item"]
+    if item:
+        tags   = ", ".join(item.get("style_tags") or [])
+        colors = ", ".join(item.get("colors") or [])
+        lines  = [
+            item["title"],
+            "─" * len(item["title"]),
+            f"Price:     ${item['price']:.2f}",
+            f"Platform:  {(item.get('platform') or '').capitalize()}",
+            f"Size:      {item.get('size', 'N/A')}",
+            f"Condition: {(item.get('condition') or 'N/A').capitalize()}",
+            f"Colors:    {colors}",
+        ]
+        if item.get("brand"):
+            lines.append(f"Brand:     {item['brand']}")
+        if tags:
+            lines.append(f"Tags:      {tags}")
+        if item.get("description"):
+            lines += ["", item["description"]]
+
+        verdict_data = session.get("price_verdict")
+        if verdict_data:
+            v = verdict_data["verdict"]
+            if v == "great_deal":
+                label = f"Great deal — median comparable is ${verdict_data['median_comparable_price']:.2f}"
+            elif v == "fair":
+                label = f"Fair price — median comparable is ${verdict_data['median_comparable_price']:.2f}"
+            elif v == "overpriced":
+                label = f"Above average — median comparable is ${verdict_data['median_comparable_price']:.2f}"
+            else:
+                label = "Not enough comparable listings to assess price"
+            lines += ["", f"Price verdict: {label}"]
+
+        listing_text = "\n".join(lines)
+    else:
+        # No item found — LLM probably asked for clarification; show its reply here
+        listing_text = session["reply"] or "No item found."
+
+    # Fall back to LLM reply only when no item was found (empty_wardrobe path).
+    # If an item was found but suggest_outfit wasn't called, keep the panel empty.
+    outfit_text = session["outfit_suggestion"] or (session["reply"] if not item else "") or ""
+    fit_card_text = session["fit_card"] or ""
+
+    return listing_text, outfit_text, fit_card_text
 
 
 # ── interface ─────────────────────────────────────────────────────────────────
